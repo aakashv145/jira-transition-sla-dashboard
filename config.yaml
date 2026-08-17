@@ -1,0 +1,14 @@
+ticket_keys:
+  - TE-9976
+  - TE-112
+  - TTN-22457
+
+jql: ""
+
+l3_field_names:
+  - "L3 triager"
+
+dev_field_names:
+  - "assignee"
+
+whole_minutes: true
