@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Jira Transition SLA Dashboard
 
 Replay Jira changelogs to calculate L3 and Dev ownership time for every assignment.
@@ -88,3 +89,6 @@ The changelog is fetched with `GET /rest/api/3/issue/{issueIdOrKey}/changelog` u
 ## Security
 
 Use a Jira API token with only the permissions required to read the relevant issues. Credentials are loaded from environment variables and never written to reports.
+=======
+# jira-transition-sla-dashboard
+>>>>>>> 56f695f3f2184b1b7a9950710fd2719e86942bd9
