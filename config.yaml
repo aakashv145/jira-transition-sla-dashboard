@@ -1,14 +1,87 @@
-ticket_keys:
-  - TE-9976
-  - TE-112
-  - TTN-22457
+# ==========================================================
+# Jira Issue Discovery
+# ==========================================================
 
-jql: ""
+# Keep empty for live dashboard mode.
+# Add Jira keys only for debugging/testing.
+ticket_keys: []
 
+# Dynamic Jira query to fetch active Jira tickets
+jql: |
+  project in (TE, TTN)
+  AND status NOT IN (
+    Done,
+    Deployed,
+    Closed,
+    Resolved,
+    "Won't Do"
+  )
+  ORDER BY updated DESC
+
+
+# ==========================================================
+# SLA Ownership Fields
+# ==========================================================
+
+# Jira custom field used for L3 ownership
 l3_field_names:
   - "L3 triager"
 
+
+# Developer ownership tracking
+# Assignee changes represent developer transitions
 dev_field_names:
   - "assignee"
 
+
+# ==========================================================
+# Workflow Status Rules
+# ==========================================================
+
+# L3 SLA stops when Jira reaches triaged state
+triaged_statuses:
+  - "Triaged"
+
+
+# Final lifecycle statuses.
+# Active Dev SLA stops immediately when Jira enters these.
+final_statuses:
+  - "Done"
+  - "Deployed"
+  - "Won't Do"
+  - "Closed"
+  - "Resolved"
+
+
+# ==========================================================
+# SLA Calculation
+# ==========================================================
+
+# Calculate duration using completed minutes only
 whole_minutes: true
+
+
+# ==========================================================
+# Jira Connection
+# ==========================================================
+
+jira:
+  base_url: "https://lambdatest.atlassian.net"
+  api_version: "3"
+
+
+# ==========================================================
+# Refresh Configuration
+# ==========================================================
+
+# Used by scheduler/dashboard refresh
+refresh_interval_minutes: 5
+
+
+# ==========================================================
+# Storage
+# ==========================================================
+
+storage:
+  type: "sqlite"
+  database: "sla_dashboard.db"

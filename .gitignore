@@ -7,3 +7,4 @@ __pycache__/
 output/*.csv
 .idea/
 .vscode/
+sla_dashboard.db
