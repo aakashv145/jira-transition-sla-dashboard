@@ -1,0 +1,166 @@
+--- AI_DI_xy7.py	2026-09-10 13:37:57.107623504 +0000
++++ AI_DI_xy8.py	2026-09-10 13:38:21.164761185 +0000
+@@ -2722,9 +2722,16 @@
+     # so hard-coding a customfield_xxxxx is intentionally avoided.
+     field_map = {}
+     try:
+-        log("fetching /field metadata")
+-        metadata = jira_get("field")
+-        log("field metadata ok")
++        shared_meta = _shared_overview_refresh_store()
++        cached_meta = shared_meta.get("field_meta")
++        if cached_meta and (time.time() - cached_meta["at"]) < FIELD_METADATA_TTL_SECONDS and cached_meta["base_url"] == base_url:
++            metadata = cached_meta["data"]
++            log("field metadata (cached)")
++        else:
++            log("fetching /field metadata")
++            metadata = jira_get("field")
++            shared_meta["field_meta"] = {"at": time.time(), "data": metadata, "base_url": base_url}
++            log("field metadata ok")
+         items = metadata if isinstance(metadata, list) else metadata.get("values", [])
+         for item in items:
+             fid = str(item.get("id") or "").strip()
+@@ -2741,6 +2748,12 @@
+     }
+ 
+     _id_to_name_cache = {}
++    # {column: {row_index: value}} applied in one assignment per column at the
++    # end. Per-cell DataFrame.at writes (~45k of them) were the slow part.
++    updates = {}
++
++    def set_error(index, message):
++        updates.setdefault("jira_refresh_error", {})[index] = message
+ 
+     def apply_issue(index, issue):
+         """Write the live Jira values from one issue payload into `result`."""
+@@ -2822,21 +2835,24 @@
+                 or str(assignee_obj.get("accountId") or "").strip()
+             )
+ 
+-            result.at[index, "status"] = clean(status_obj.get("name"))
+-            result.at[index, "resolution"] = clean(resolution_obj.get("name"))
+-            result.at[index, "issue_type"] = clean(issue_type_obj.get("name"))
+-            result.at[index, "assignee"] = live_assignee
+-            result.at[index, "reporter"] = live_reporter
+-            result.at[index, "reporter_aliases"] = " | ".join(aliases)
+-            result.at[index, "assignee_verified"] = True
+-            result.at[index, "jira_verified"] = True
+-            result.at[index, "priority"] = live_priority
+-            result.at[index, "bug_severity"] = normalized_bug_severity
+-            result.at[index, "issue_urgency"] = clean(issue_urgency)
+-            result.at[index, "issue_impact"] = clean(issue_impact)
+-            result.at[index, "created"] = clean(fields.get("created"))
+-            result.at[index, "updated"] = clean(fields.get("updated"))
+-            result.at[index, "jira_refresh_error"] = ""
++            for column, value in (
++                ("status", clean(status_obj.get("name"))),
++                ("resolution", clean(resolution_obj.get("name"))),
++                ("issue_type", clean(issue_type_obj.get("name"))),
++                ("assignee", live_assignee),
++                ("reporter", live_reporter),
++                ("reporter_aliases", " | ".join(aliases)),
++                ("assignee_verified", True),
++                ("jira_verified", True),
++                ("priority", live_priority),
++                ("bug_severity", normalized_bug_severity),
++                ("issue_urgency", clean(issue_urgency)),
++                ("issue_impact", clean(issue_impact)),
++                ("created", clean(fields.get("created"))),
++                ("updated", clean(fields.get("updated"))),
++                ("jira_refresh_error", ""),
++            ):
++                updates.setdefault(column, {})[index] = value
+ 
+     # ------------------------------------------------------------------
+     # Fetch strategy
+@@ -2883,6 +2899,19 @@
+         })
+         return s
+ 
++    def post_with_retry(sess, url, body, attempts=4):
++        """POST that honours Jira Cloud 429 rate limiting (Retry-After)."""
++        for attempt in range(attempts):
++            response = sess.post(url, json=body, timeout=60)
++            if response.status_code != 429 or attempt == attempts - 1:
++                return response
++            try:
++                wait = float(response.headers.get("Retry-After", 0)) or 2 ** attempt
++            except ValueError:
++                wait = 2 ** attempt
++            time.sleep(min(wait, 10))
++        return response
++
+     def jira_search_batch(keys):
+         """Return {KEY: issue} for a batch of keys.
+ 
+@@ -2910,8 +2939,8 @@
+                     body["expand"] = search_expand
+                 if token:
+                     body["nextPageToken"] = token
+-                response = worker_session.post(
+-                    f"{base_url}/rest/api/3/search/jql", json=body, timeout=60
++                response = post_with_retry(
++                    worker_session, f"{base_url}/rest/api/3/search/jql", body
+                 )
+                 response.raise_for_status()
+                 data = response.json()
+@@ -2998,7 +3027,7 @@
+                 try:
+                     fetched[k] = fut.result()
+                 except Exception as exc:
+-                    result.at[key_to_index[k], "jira_refresh_error"] = str(exc)
++                    set_error(key_to_index[k], str(exc))
+                     log(f"  {k}: {str(exc)[:120]}")
+ 
+     log(f"applying {len(fetched)} fetched issues")
+@@ -3007,15 +3036,26 @@
+             issue = fetched.get(key_upper)
+             if issue is None:
+                 if key_upper not in attempted:
+-                    result.at[index, "jira_refresh_error"] = (
+-                        "Not returned by bulk JQL search and per-issue fallback budget exhausted"
+-                    )
++                    set_error(index, "Not returned by bulk JQL search and per-issue fallback budget exhausted")
+                 continue  # individual fetch failed: its error is already recorded
+             apply_issue(index, issue)
+         except Exception as exc:
+-            result.at[index, "jira_refresh_error"] = str(exc)
++            set_error(index, str(exc))
+             continue
+ 
++    log(f"parsed issues; writing {len(updates)} columns")
++    for column, values in updates.items():
++        if not values:
++            continue
++        if column in result.columns:
++            merged = result[column].astype(object)
++        else:
++            merged = pd.Series(pd.NA, index=result.index, dtype=object)
++        merged.loc[list(values.keys())] = list(values.values())
++        if column in ("assignee_verified", "jira_verified"):
++            merged = merged.fillna(False).astype(bool)
++        result[column] = merged
++
+     log("done")
+     return result
+ 
+@@ -3024,7 +3064,10 @@
+ 
+ # Parallel bulk-search requests to Jira. Keep modest to stay well inside
+ # Jira Cloud rate limits.
+-JIRA_REFRESH_WORKERS = 6
++JIRA_REFRESH_WORKERS = 10
++
++# Jira field definitions (name -> customfield id) almost never change.
++FIELD_METADATA_TTL_SECONDS = 6 * 60 * 60
+ 
+ 
+ @st.cache_resource(show_spinner=False)
+@@ -4111,6 +4154,7 @@
+ 
+ def _progress(msg):
+     _status_line.write(f"{time.perf_counter() - _t0:5.1f}s — {msg}")
++    _stage(f"  progress: {msg}")
+ 
+ _stage("filters rendered; starting build_consolidated_dataset")
+ _progress(f"tickets in DB: {len(ticket_summary):,}, transitions: {len(transitions):,}")
