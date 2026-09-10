@@ -429,6 +429,9 @@ def load_table(table_name):
 PERSON_ROLE_MAP = {
     "aakash verma": "L3",
     "anshul rawat": "L3",
+    "mahesh rai": "L3",
+    "sunil rajput": "L3",
+    "belal ahmad": "L3",
     "kartikay sharma": "DEV",
 }
 
