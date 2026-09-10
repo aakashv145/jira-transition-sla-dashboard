@@ -1,0 +1,289 @@
+diff --git a/AI_DI_xy5.py b/AI_DI_xy5.py
+index 2bc2aa3..1093062 100644
+--- a/AI_DI_xy5.py
++++ b/AI_DI_xy5.py
+@@ -2697,6 +2697,8 @@ def refresh_current_jira_fields(df, progress=None):
+         "issueimpact": field_map.get("issueimpact", ""),
+     }
+ 
++    _id_to_name_cache = {}
++
+     def apply_issue(index, issue):
+         """Write the live Jira values from one issue payload into `result`."""
+         if True:
+@@ -2712,9 +2714,16 @@ def refresh_current_jira_fields(df, progress=None):
+ 
+             # Some Jira responses expose names only in the issue-level map;
+             # combine it with the global /field metadata.
+-            id_to_name = dict(field_map)
+-            for fid, fname in names_map.items():
+-                id_to_name[norm_field_name(fname)] = str(fid).strip()
++            # Build the merged name->id map once per distinct names_map
++            # (one per search batch) instead of copying the full /field
++            # metadata dict for every single issue.
++            cache_id = id(names_map) if names_map else None
++            id_to_name = _id_to_name_cache.get(cache_id)
++            if id_to_name is None:
++                id_to_name = dict(field_map)
++                for fid, fname in names_map.items():
++                    id_to_name[norm_field_name(fname)] = str(fid).strip()
++                _id_to_name_cache[cache_id] = id_to_name
+ 
+             def named_value(name):
+                 fid = id_to_name.get(norm_field_name(name), "")
+@@ -2806,38 +2815,84 @@ def refresh_current_jira_fields(df, progress=None):
+ 
+     fetched = {}
+ 
++    # Request only the fields apply_issue() reads when all three custom
++    # field IDs were resolved from /field.  "*all" + expand=names returns every
++    # custom field on every issue and was the bulk of the payload.  If any ID
++    # is unknown, keep the old "*all" behaviour so severity discovery still
++    # works.
++    base_fields = [
++        "status", "resolution", "issuetype", "assignee", "reporter",
++        "priority", "created", "updated",
++    ]
++    if all(wanted_ids.values()):
++        search_fields = base_fields + list(wanted_ids.values())
++        search_expand = None
++    else:
++        search_fields = ["*all"]
++        search_expand = "names"
++
++    def make_session():
++        s = requests.Session()
++        s.auth = (jira_user, jira_token)
++        s.headers.update({
++            "Accept": "application/json",
++            "Content-Type": "application/json",
++        })
++        return s
++
+     def jira_search_batch(keys):
+-        """Return {KEY: issue} for a batch of keys, trying the search endpoints in order."""
++        """Return {KEY: issue} for a batch of keys.
++
++        Runs in a worker thread: uses its own Session and must not call
++        log()/progress (Streamlit elements are main-thread only).
++        """
++        worker_session = make_session()
+         jql = "key in (" + ",".join(f'"{k}"' for k in keys) + ")"
+-        body_v3 = {
+-            "jql": jql,
+-            "maxResults": len(keys),
+-            "fields": ["*all"],
+-            "expand": "names",
+-        }
+-        body_v2 = dict(body_v3, expand=["names"])
+-        attempts = [
+-            ("POST", "3/search/jql", body_v3),        # Jira Cloud (current)
+-            ("POST", "3/search", body_v3),            # Jira Cloud (legacy)
+-            ("POST", "2/search", body_v2),            # Jira Server / DC
+-        ]
+-        last_error = None
+-        for method, path, payload in attempts:
+-            try:
+-                response = session.request(
+-                    method,
+-                    f"{base_url}/rest/api/{path}",
+-                    json=payload,
+-                    timeout=60,
++
++        def collect(data, out):
++            names_map = data.get("names") or {}
++            for issue in data.get("issues") or []:
++                if names_map and not issue.get("names"):
++                    issue["names"] = names_map
++                out[str(issue.get("key") or "").strip().upper()] = issue
++
++        # Jira Cloud current endpoint, token-paginated.
++        try:
++            out = {}
++            token = None
++            seen = set()
++            while True:
++                body = {"jql": jql, "maxResults": len(keys), "fields": search_fields}
++                if search_expand:
++                    body["expand"] = search_expand
++                if token:
++                    body["nextPageToken"] = token
++                response = worker_session.post(
++                    f"{base_url}/rest/api/3/search/jql", json=body, timeout=60
+                 )
+                 response.raise_for_status()
+                 data = response.json()
+-                names_map = data.get("names") or {}
++                collect(data, out)
++                token = data.get("nextPageToken")
++                if data.get("isLast", True) or not token or token in seen:
++                    break
++                seen.add(token)
++            return out
++        except Exception as exc:
++            last_error = exc
++
++        # Legacy fallbacks (removed on Jira Cloud; kept for Server/DC).
++        for path, expand in (("3/search", search_expand), ("2/search", [search_expand] if search_expand else None)):
++            try:
++                body = {"jql": jql, "maxResults": len(keys), "fields": search_fields}
++                if expand:
++                    body["expand"] = expand
++                response = worker_session.post(
++                    f"{base_url}/rest/api/{path}", json=body, timeout=60
++                )
++                response.raise_for_status()
+                 out = {}
+-                for issue in data.get("issues") or []:
+-                    if names_map and not issue.get("names"):
+-                        issue["names"] = names_map
+-                    out[str(issue.get("key") or "").strip().upper()] = issue
++                collect(response.json(), out)
+                 return out
+             except Exception as exc:
+                 last_error = exc
+@@ -2845,17 +2900,25 @@ def refresh_current_jira_fields(df, progress=None):
+ 
+     all_keys = list(key_to_index.keys())
+     if len(all_keys) > 1:
++        from concurrent.futures import ThreadPoolExecutor, as_completed
++
+         batch_size = 100
+-        n_batches = (len(all_keys) + batch_size - 1) // batch_size
+-        for b, start in enumerate(range(0, len(all_keys), batch_size), 1):
+-            batch = all_keys[start:start + batch_size]
+-            log(f"bulk search batch {b}/{n_batches} ({len(batch)} keys)")
+-            try:
+-                got = jira_search_batch(batch)
+-                fetched.update(got)
+-                log(f"batch {b} returned {len(got)} issues")
+-            except Exception as exc:
+-                log(f"batch {b} FAILED: {exc}")
++        batches = [all_keys[i:i + batch_size] for i in range(0, len(all_keys), batch_size)]
++        n_batches = len(batches)
++        max_workers = min(JIRA_REFRESH_WORKERS, n_batches)
++        log(f"bulk search: {n_batches} batches, {max_workers} parallel, fields={'limited' if search_expand is None else '*all'}")
++        done = 0
++        with ThreadPoolExecutor(max_workers=max_workers) as pool:
++            futures = {pool.submit(jira_search_batch, b): i for i, b in enumerate(batches, 1)}
++            for future in as_completed(futures):
++                b = futures[future]
++                done += 1
++                try:
++                    got = future.result()
++                    fetched.update(got)
++                    log(f"batch {b} returned {len(got)} issues ({done}/{n_batches} done)")
++                except Exception as exc:
++                    log(f"batch {b} FAILED: {exc}")
+ 
+     # Hard cap on per-issue fallbacks.  If the bulk search endpoint is not
+     # reachable we surface that as a per-row error instead of silently making
+@@ -2889,6 +2952,17 @@ def refresh_current_jira_fields(df, progress=None):
+ 
+ OVERVIEW_REFRESH_TTL_SECONDS = 600
+ 
++# Parallel bulk-search requests to Jira. Keep modest to stay well inside
++# Jira Cloud rate limits.
++JIRA_REFRESH_WORKERS = 6
++
++
++@st.cache_resource(show_spinner=False)
++def _shared_overview_refresh_store():
++    """Process-wide store so every browser tab/session reuses one Jira pull."""
++    import threading
++    return {"lock": threading.Lock(), "entries": {}}
++
+ 
+ def refresh_current_jira_fields_cached(df, cache_key, _progress=None):
+     """
+@@ -2900,8 +2974,10 @@ def refresh_current_jira_fields_cached(df, cache_key, _progress=None):
+     (CacheReplayClosureError).  Keyed on the set of ticket keys; entries
+     expire after OVERVIEW_REFRESH_TTL_SECONDS.  The Refresh button clears it.
+     """
+-    store = st.session_state.setdefault("_overview_refresh_cache", {})
+-    entry = store.get(cache_key)
++    shared = _shared_overview_refresh_store()
++    store = shared["entries"]
++    with shared["lock"]:
++        entry = store.get(cache_key)
+     now = time.time()
+     if entry and (now - entry["at"]) < OVERVIEW_REFRESH_TTL_SECONDS:
+         if _progress is not None:
+@@ -2911,9 +2987,10 @@ def refresh_current_jira_fields_cached(df, cache_key, _progress=None):
+     result = refresh_current_jira_fields(df, progress=_progress)
+ 
+     # Keep the cache small: one entry per distinct ticket set, drop stale ones.
+-    for k in [k for k, v in store.items() if (now - v["at"]) >= OVERVIEW_REFRESH_TTL_SECONDS]:
+-        store.pop(k, None)
+-    store[cache_key] = {"at": now, "df": result.copy()}
++    with shared["lock"]:
++        for k in [k for k, v in store.items() if (now - v["at"]) >= OVERVIEW_REFRESH_TTL_SECONDS]:
++            store.pop(k, None)
++        store[cache_key] = {"at": now, "df": result.copy()}
+     return result
+ 
+ 
+@@ -2938,8 +3015,14 @@ def add_dashboard_sla_health(df, transitions):
+ 
+     transition_map = {}
+     if transitions is not None and not transitions.empty and "ticket" in transitions.columns:
+-        for key, rows in transitions.groupby("ticket", dropna=False):
+-            transition_map[str(key).strip().upper()] = rows.copy()
++        # Only group transitions for tickets actually on screen, and skip the
++        # per-group copy (build_sla_health_snapshot copies its input already).
++        wanted = set(result["ticket"].astype(str).str.strip().str.upper())
++        norm_keys = transitions["ticket"].astype(str).str.strip().str.upper()
++        mask = norm_keys.isin(wanted)
++        subset = transitions[mask]
++        for key, rows in subset.groupby(norm_keys[mask], sort=False):
++            transition_map[key] = rows
+ 
+     for idx, row in result.iterrows():
+         ticket_key = str(row.get("ticket", "")).strip().upper()
+@@ -3815,6 +3898,9 @@ with header_right:
+         if st.button("↻ Refresh", width="stretch", key="overview_refresh"):
+             st.cache_data.clear()  # force a fresh live Jira pull
+             st.session_state.pop("_overview_refresh_cache", None)
++            _shared = _shared_overview_refresh_store()
++            with _shared["lock"]:
++                _shared["entries"].clear()
+             st.session_state.last_refresh = time.time()
+             st.rerun()
+     with action_b:
+@@ -3891,7 +3977,10 @@ if overview_range == "Custom":
+ # rerun was still paying the full ~145s rebuild cost even after caching was
+ # added. Flooring to the minute means reruns within the same minute share
+ # an identical cache key and actually hit the cache.
+-now_utc = pd.Timestamp.now(tz="UTC").floor("min")
++# Day granularity: the window ends at the next UTC midnight, so the cache key
++# (start, end) stays identical all day instead of changing every minute and
++# forcing a full rebuild once per minute.
++now_utc = pd.Timestamp.now(tz="UTC").normalize() + pd.Timedelta(days=1)
+ if overview_range == "Last 7 Days":
+     overview_start = now_utc - pd.Timedelta(days=7)
+ elif overview_range == "Last 3 Months":
+diff --git a/database.py b/database.py
+index c5c33b5..3f5cbbd 100644
+--- a/database.py
++++ b/database.py
+@@ -17,10 +17,18 @@ DB_NAME = BASE_DIR / "sla_dashboard.db"
+ 
+ def get_connection():
+ 
+-    return sqlite3.connect(
+-        DB_NAME
++    conn = sqlite3.connect(
++        DB_NAME,
++        timeout=30
+     )
+ 
++    # WAL lets the Streamlit dashboard read while this writer is committing,
++    # instead of the dashboard waiting on "database is locked" retries.
++    conn.execute("PRAGMA journal_mode=WAL")
++    conn.execute("PRAGMA busy_timeout=30000")
++
++    return conn
++
+ 
+ # =====================================================
+ # INITIALIZE DATABASE

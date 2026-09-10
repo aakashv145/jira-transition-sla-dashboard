@@ -1,0 +1,467 @@
+--- AI_DI_v1.py	2026-09-10 12:51:59.527806580 +0000
++++ AI_DI_xy5.py	2026-09-10 12:56:04.374421865 +0000
+@@ -1,5 +1,6 @@
+ import sqlite3
+ import time
++from collections import Counter
+ import json
+ from datetime import datetime, timezone
+ from pathlib import Path
+@@ -465,7 +466,9 @@
+             if str(r or "").strip().upper() in {"L3", "DEV"}
+         ]
+         if roles:
+-            return str(pd.Series(roles).value_counts().index[0])
++            # Counter.most_common keeps first-seen order on ties, matching the
++            # previous pd.Series(...).value_counts() result, at ~1/100 the cost.
++            return str(Counter(roles).most_common(1)[0][0])
+ 
+     return ""
+ 
+@@ -561,22 +564,27 @@
+     for person, person_df in result.groupby("assigned_to", dropna=False):
+         evidence[str(person).strip().lower()] = person_df["role"].tolist()
+ 
+-    if "reporter" in result.columns:
+-        result["role"] = result.apply(
+-            lambda row: canonical_person_role(
+-                row.get("assigned_to"),
+-                evidence.get(str(row.get("assigned_to") or "").strip().lower(), []),
+-                reporter=row.get("reporter"),
+-            ),
+-            axis=1,
+-        )
+-    else:
+-        result["role"] = result["assigned_to"].apply(
+-            lambda person: canonical_person_role(
++    # The role depends only on (person, reporter), and a person's evidence
++    # list can hold hundreds of rows, so resolve each distinct pair once.
++    memo = {}
++
++    def resolve(person, reporter=None):
++        key = (person, reporter)
++        if key not in memo:
++            memo[key] = canonical_person_role(
+                 person,
+-                evidence.get(str(person).strip().lower(), []),
++                evidence.get(str(person or "").strip().lower(), []),
++                reporter=reporter,
+             )
+-        )
++        return memo[key]
++
++    if "reporter" in result.columns:
++        result["role"] = [
++            resolve(person, reporter)
++            for person, reporter in zip(result["assigned_to"], result["reporter"])
++        ]
++    else:
++        result["role"] = [resolve(person) for person in result["assigned_to"]]
+ 
+     return result
+ 
+@@ -1411,41 +1419,13 @@
+     return is_final_status(status) or is_final_status(resolution)
+ 
+ 
+-def build_sla_health_snapshot(timeline, current_status, current_priority, current_resolution=None):
+-    """
+-    Build deterministic SLA-health facts before any AI explanation.
++def _sla_health_core(current_status, current_priority, current_resolution,
++                     total_minutes, longest_minutes, longest_status):
++    """Score/health/risk-factor rules shared by the ticket page and overview.
+ 
+-    A resolved Jira (status or resolution in FINAL_STATUSES) is reported as
+-    RESOLVED with risk 0.  It is never shown as BREACHED / AT RISK, because
+-    there is nothing left to act on.  The historical over/under-target figure
+-    is still surfaced in the risk factor for reporting.
++    `total_minutes` excludes SLA-hold time; `longest_minutes`/`longest_status`
++    describe the largest non-hold status bucket (None when there is none).
+     """
+-    if timeline is None or timeline.empty:
+-        return {}
+-
+-    work = timeline.copy()
+-    work["duration_minutes"] = pd.to_numeric(
+-        work.get("duration_minutes", 0), errors="coerce"
+-    ).fillna(0)
+-    work["Jira Status"] = work.get("status", "").fillna("").astype(str).str.strip()
+-    work["Jira Status"] = work["Jira Status"].replace(
+-        {"": "Unknown", "nan": "Unknown", "None": "Unknown"}
+-    )
+-
+-    status_totals = (
+-        work.groupby("Jira Status", as_index=False)["duration_minutes"]
+-        .sum()
+-        .sort_values("duration_minutes", ascending=False)
+-    )
+-
+-    # SLA clock pauses while awaiting the customer, or while the ticket is
+-    # parked "Under Observation" with the team.
+-    customer_wait_mask = work["Jira Status"].apply(is_sla_hold_status)
+-    customer_wait_minutes = float(work.loc[customer_wait_mask, "duration_minutes"].sum())
+-    work = work[~customer_wait_mask]
+-    status_totals = status_totals[~status_totals["Jira Status"].apply(is_sla_hold_status)]
+-
+-    total_minutes = float(work["duration_minutes"].sum())
+     target_hours = priority_target_hours(current_priority)
+     total_hours = total_minutes / 60.0
+     breach_hours = max(0.0, total_hours - target_hours)
+@@ -1467,9 +1447,8 @@
+     if "pending rca" in normalized_status:
+         score += 20
+ 
+-    if not status_totals.empty:
+-        longest = float(status_totals.iloc[0]["duration_minutes"])
+-        if total_minutes and longest / total_minutes >= 0.70:
++    if longest_minutes is not None:
++        if total_minutes and longest_minutes / total_minutes >= 0.70:
+             score += 10
+ 
+     score = min(100, int(score))
+@@ -1479,9 +1458,6 @@
+         health = "RESOLVED"
+         score = 0
+     elif currently_on_hold:
+-        # Ball is not with the team right now (awaiting customer / under
+-        # observation) — never surface this as an active breach that needs
+-        # action, regardless of time accrued before it went on hold.
+         health = "AT RISK" if score >= 40 else "HEALTHY"
+     elif score >= 70:
+         health = "BREACHED"
+@@ -1490,8 +1466,6 @@
+     else:
+         health = "HEALTHY"
+ 
+-    # Human-readable deterministic risk drivers. These are intentionally based
+-    # only on Jira/SLA data and are safe to show directly on the dashboard.
+     risk_drivers = []
+     if target_hours > 0:
+         utilization = (total_hours / target_hours) * 100.0
+@@ -1509,11 +1483,9 @@
+     elif is_observation_status(current_status):
+         risk_drivers.insert(0, "SLA paused — under observation")
+ 
+-    if not status_totals.empty and total_minutes:
+-        longest = float(status_totals.iloc[0]["duration_minutes"])
+-        concentration = (longest / total_minutes) * 100.0
++    if longest_minutes is not None and total_minutes:
++        concentration = (longest_minutes / total_minutes) * 100.0
+         if concentration >= 70:
+-            longest_status = str(status_totals.iloc[0]["Jira Status"])
+             risk_drivers.append(f"{concentration:.0f}% of SLA in {longest_status}")
+ 
+     if not risk_drivers:
+@@ -1530,6 +1502,67 @@
+         "health": health,
+         "risk_score": score,
+         "risk_factor": " • ".join(risk_drivers[:2]),
++        "sla_paused": currently_on_hold,
++        "target_hours": target_hours,
++        "breach_hours": breach_hours,
++    }
++
++
++def build_sla_health_snapshot(timeline, current_status, current_priority, current_resolution=None):
++    """
++    Build deterministic SLA-health facts before any AI explanation.
++
++    A resolved Jira (status or resolution in FINAL_STATUSES) is reported as
++    RESOLVED with risk 0.  It is never shown as BREACHED / AT RISK, because
++    there is nothing left to act on.  The historical over/under-target figure
++    is still surfaced in the risk factor for reporting.
++    """
++    if timeline is None or timeline.empty:
++        return {}
++
++    work = timeline.copy()
++    work["duration_minutes"] = pd.to_numeric(
++        work.get("duration_minutes", 0), errors="coerce"
++    ).fillna(0)
++    work["Jira Status"] = work.get("status", "").fillna("").astype(str).str.strip()
++    work["Jira Status"] = work["Jira Status"].replace(
++        {"": "Unknown", "nan": "Unknown", "None": "Unknown"}
++    )
++
++    status_totals = (
++        work.groupby("Jira Status", as_index=False)["duration_minutes"]
++        .sum()
++        .sort_values("duration_minutes", ascending=False)
++    )
++
++    # SLA clock pauses while awaiting the customer, or while the ticket is
++    # parked "Under Observation" with the team.
++    customer_wait_mask = work["Jira Status"].apply(is_sla_hold_status)
++    customer_wait_minutes = float(work.loc[customer_wait_mask, "duration_minutes"].sum())
++    work = work[~customer_wait_mask]
++    status_totals = status_totals[~status_totals["Jira Status"].apply(is_sla_hold_status)]
++
++    total_minutes = float(work["duration_minutes"].sum())
++    if not status_totals.empty:
++        longest_minutes = float(status_totals.iloc[0]["duration_minutes"])
++        longest_status = str(status_totals.iloc[0]["Jira Status"])
++    else:
++        longest_minutes, longest_status = None, ""
++
++    core = _sla_health_core(
++        current_status, current_priority, current_resolution,
++        total_minutes, longest_minutes, longest_status,
++    )
++    health = core["health"]
++    score = core["risk_score"]
++    currently_on_hold = core["sla_paused"]
++    target_hours = core["target_hours"]
++    breach_hours = core["breach_hours"]
++
++    return {
++        "health": health,
++        "risk_score": score,
++        "risk_factor": core["risk_factor"],
+         "current_status": str(current_status or "Unknown"),
+         "priority": str(current_priority or "Unknown"),
+         "total_sla": format_minutes(total_minutes),
+@@ -2436,15 +2469,25 @@
+     rows = []
+ 
+     data = transitions.copy()
+-    data["sort_date"] = data["assigned_at"].apply(safe_datetime)
+-
+-    for ticket, ticket_df in data.groupby("ticket", dropna=True):
+-        ticket_df = ticket_df.sort_values(
+-            "sort_date",
+-            na_position="first",
++    # Parse the whole column once (format="mixed" parses each value on its
++    # own, like the old per-row safe_datetime) instead of 13k single calls.
++    try:
++        data["sort_date"] = pd.to_datetime(
++            data["assigned_at"].replace({"": None}),
++            errors="coerce",
++            utc=True,
++            format="mixed",
+         )
+-        last = ticket_df.iloc[-1]
++    except (TypeError, ValueError):
++        # pandas < 2.0 has no format="mixed"; fall back to per-value parsing.
++        data["sort_date"] = data["assigned_at"].apply(safe_datetime)
++    data = data[data["ticket"].notna()]
++    # One stable sort for all tickets; the last row per ticket is the latest.
++    data = data.sort_values("sort_date", na_position="first", kind="stable")
++    latest = data.groupby("ticket", sort=True).tail(1).sort_values("ticket", kind="stable")
+ 
++    for last in latest.to_dict("records"):
++        ticket = last.get("ticket")
+         owner = last.get("assigned_to") or "UNASSIGNED"
+         ticket_key = str(ticket).strip().upper()
+         reporter = str((reporter_map or {}).get(ticket_key, "") or "").strip()
+@@ -2924,23 +2967,50 @@
+     # reachable we surface that as a per-row error instead of silently making
+     # thousands of sequential requests again.
+     fallback_budget = 50 if len(all_keys) > 1 else len(all_keys)
+-    fallback_used = 0
+ 
+-    log(f"applying {len(fetched)} fetched issues; up to {fallback_budget} per-issue fallbacks")
++    missing = [k for k in key_to_index if k not in fetched]
++    attempted = set()
++    if missing:
++        allowed = missing[:fallback_budget]
++        attempted = set(allowed)
++        log(f"{len(missing)} keys not returned by search; fetching {len(allowed)} individually")
++
++        def fetch_one(key_upper):
++            s_ = make_session()
++            last_exc = None
++            for version in ("3", "2"):
++                try:
++                    r = s_.get(
++                        f"{base_url}/rest/api/{version}/issue/{quote(key_upper, safe='')}",
++                        params={"fields": ",".join(search_fields), **({"expand": search_expand} if search_expand else {})},
++                        timeout=15,
++                    )
++                    r.raise_for_status()
++                    return r.json()
++                except Exception as exc:
++                    last_exc = exc
++            raise last_exc
++
++        from concurrent.futures import ThreadPoolExecutor as _TPE
++        with _TPE(max_workers=min(JIRA_REFRESH_WORKERS, len(allowed)) or 1) as pool:
++            futs = {k: pool.submit(fetch_one, k) for k in allowed}
++            for k, fut in futs.items():
++                try:
++                    fetched[k] = fut.result()
++                except Exception as exc:
++                    result.at[key_to_index[k], "jira_refresh_error"] = str(exc)
++                    log(f"  {k}: {str(exc)[:120]}")
++
++    log(f"applying {len(fetched)} fetched issues")
+     for key_upper, index in key_to_index.items():
+         try:
+             issue = fetched.get(key_upper)
+             if issue is None:
+-                if fallback_used >= fallback_budget:
++                if key_upper not in attempted:
+                     result.at[index, "jira_refresh_error"] = (
+                         "Not returned by bulk JQL search and per-issue fallback budget exhausted"
+                     )
+-                    continue
+-                fallback_used += 1
+-                issue = jira_get(
+-                    f"issue/{quote(key_upper, safe='')}",
+-                    params={"fields": "*all", "expand": "names"},
+-                )
++                continue  # individual fetch failed: its error is already recorded
+             apply_issue(index, issue)
+         except Exception as exc:
+             result.at[index, "jira_refresh_error"] = str(exc)
+@@ -3013,40 +3083,73 @@
+     if result.empty:
+         return result
+ 
+-    transition_map = {}
++    # Per-ticket aggregates computed once for every ticket (same rules as
++    # build_sla_health_snapshot, which previously ran ~20 pandas ops per row).
++    def _jira_status(series):
++        return (
++            series.fillna("").astype(str).str.strip()
++            .replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"})
++        )
++
++    agg_total, agg_longest = {}, {}
+     if transitions is not None and not transitions.empty and "ticket" in transitions.columns:
+-        # Only group transitions for tickets actually on screen, and skip the
+-        # per-group copy (build_sla_health_snapshot copies its input already).
+         wanted = set(result["ticket"].astype(str).str.strip().str.upper())
+         norm_keys = transitions["ticket"].astype(str).str.strip().str.upper()
+         mask = norm_keys.isin(wanted)
+-        subset = transitions[mask]
+-        for key, rows in subset.groupby(norm_keys[mask], sort=False):
+-            transition_map[key] = rows
++        work = pd.DataFrame({
++            "key": norm_keys[mask].values,
++            "js": _jira_status(transitions.loc[mask, "status"]).values
++                  if "status" in transitions.columns else "Unknown",
++            "dm": pd.to_numeric(
++                transitions.loc[mask, "duration_minutes"], errors="coerce"
++            ).fillna(0).values if "duration_minutes" in transitions.columns else 0.0,
++        })
++        if not work.empty:
++            hold_lookup = {s_: is_sla_hold_status(s_) for s_ in work["js"].unique()}
++            active = work[~work["js"].map(hold_lookup)]
++            for key in work["key"].unique():
++                agg_total[key] = 0.0
++            if not active.empty:
++                agg_total.update(active.groupby("key")["dm"].sum().astype(float).to_dict())
++                per_status = active.groupby(["key", "js"], as_index=False)["dm"].sum()
++                # Largest bucket first; ties -> alphabetical status (old order).
++                per_status = per_status.sort_values(
++                    ["key", "dm", "js"], ascending=[True, False, True], kind="stable"
++                ).drop_duplicates("key", keep="first")
++                agg_longest = {
++                    k: (float(m), str(s_))
++                    for k, m, s_ in zip(per_status["key"], per_status["dm"], per_status["js"])
++                }
+ 
+-    for idx, row in result.iterrows():
++    risk_scores, healths, risk_factors = [], [], []
++    for row in result.to_dict("records"):
+         ticket_key = str(row.get("ticket", "")).strip().upper()
+-        timeline = transition_map.get(ticket_key, pd.DataFrame())
+-
+-        # If no transition history exists, use the consolidated SLA total so
+-        # the dashboard can still provide a useful deterministic health state.
+-        if timeline.empty:
++        status = row.get("status", "Unknown")
++        if ticket_key in agg_total:
++            total_minutes = agg_total[ticket_key]
++            longest_minutes, longest_status = agg_longest.get(ticket_key, (None, ""))
++        else:
++            # No transition history: single-row timeline from consolidated total.
+             total_minutes = float(pd.to_numeric(row.get("total_minutes", 0), errors="coerce") or 0)
+-            timeline = pd.DataFrame([{
+-                "status": row.get("status", "Unknown"),
+-                "duration_minutes": total_minutes,
+-            }])
++            js = _jira_status(pd.Series([status])).iloc[0]
++            if is_sla_hold_status(js):
++                total_minutes, longest_minutes, longest_status = 0.0, None, ""
++            else:
++                longest_minutes, longest_status = total_minutes, js
+ 
+-        snapshot = build_sla_health_snapshot(
+-            timeline,
+-            row.get("status", "Unknown"),
++        core = _sla_health_core(
++            status,
+             row.get("Priority", row.get("priority", "Unknown")),
+             row.get("resolution", ""),
++            total_minutes, longest_minutes, longest_status,
+         )
+-
+-        result.at[idx, "Risk Score"] = int(snapshot.get("risk_score", 0))
+-        result.at[idx, "Jira Health"] = snapshot.get("health", "UNKNOWN")
+-        result.at[idx, "Risk Factor"] = snapshot.get("risk_factor", "No SLA data")
++        risk_scores.append(int(core["risk_score"]))
++        healths.append(core["health"])
++        risk_factors.append(core["risk_factor"])
++
++    result["Risk Score"] = risk_scores
++    result["Jira Health"] = healths
++    result["Risk Factor"] = risk_factors
+ 
+     return result
+ 
+@@ -3729,21 +3832,19 @@
+     )
+ 
+     # Resolve current state from the live owner/status.
++    # {TICKET: {owner_lower: [roles in row order]}} built in one pass instead
++    # of string-filtering the ticket's transitions for every overview row.
+     evidence = {}
+     if not transitions.empty:
+-        for key, rows in transitions.groupby("ticket", dropna=False):
+-            evidence[str(key).strip().upper()] = rows
++        _ev_tickets = transitions["ticket"].astype(str).str.strip().str.upper()
++        _ev_owners = transitions["assigned_to"].fillna("").astype(str).str.strip().str.lower()
++        for t_key, o_key, role_value in zip(_ev_tickets, _ev_owners, transitions["role"]):
++            evidence.setdefault(t_key, {}).setdefault(o_key, []).append(role_value)
+ 
+     def live_state(row):
+         key = str(row.get("ticket", "")).strip().upper()
+         owner = str(row.get("current_owner") or "UNASSIGNED").strip()
+-        rows = evidence.get(key)
+-        roles = []
+-        if rows is not None and not rows.empty:
+-            roles = rows.loc[
+-                rows["assigned_to"].fillna("").astype(str).str.strip().str.lower() == owner.lower(),
+-                "role",
+-            ].tolist()
++        roles = list(evidence.get(key, {}).get(owner.lower(), []))
+         return current_state_for_status(
+             owner,
+             row.get("status", ""),
+@@ -3770,12 +3871,20 @@
+         ).fillna(0)
+ 
+         if reporter_map and "assigned_to" in work.columns:
+-            def _safe_role(row):
+-                owner = str(row.get("assigned_to") or "").strip()
+-                key = str(row.get("ticket") or "").strip().upper()
++            _role_memo = {}
++
++            def _safe_role(owner_raw, ticket_raw, role_raw):
++                owner = str(owner_raw or "").strip()
++                key = str(ticket_raw or "").strip().upper()
+                 reporter = str(reporter_map.get(key, "") or "").strip()
+-                return canonical_person_role(owner, existing_roles=[row.get("role", "")], reporter=reporter) or str(row.get("role") or "").upper()
+-            work["role"] = work.apply(_safe_role, axis=1)
++                memo_key = (owner, reporter, role_raw)
++                if memo_key not in _role_memo:
++                    _role_memo[memo_key] = canonical_person_role(owner, existing_roles=[role_raw], reporter=reporter) or str(role_raw or "").upper()
++                return _role_memo[memo_key]
++            work["role"] = [
++                _safe_role(o, t, r)
++                for o, t, r in zip(work["assigned_to"], work["ticket"], work["role"] if "role" in work.columns else [""] * len(work))
++            ]
+ 
+         work.loc[work["role"].astype(str).str.upper().eq("REPORTER"), "duration_minutes"] = 0
+ 
