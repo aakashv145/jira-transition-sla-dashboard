@@ -3884,7 +3884,14 @@ if overview_range == "Custom":
         key="overview_custom_dates",
     )
 
-now_utc = pd.Timestamp.now(tz="UTC")
+# Round to the minute (floor) instead of using full microsecond precision.
+# build_consolidated_dataset() is cached on (summary, transitions, start,
+# end, live_jira) — a raw pd.Timestamp.now() here changes on every single
+# rerun (down to the microsecond), so the cache key never repeats and every
+# rerun was still paying the full ~145s rebuild cost even after caching was
+# added. Flooring to the minute means reruns within the same minute share
+# an identical cache key and actually hit the cache.
+now_utc = pd.Timestamp.now(tz="UTC").floor("min")
 if overview_range == "Last 7 Days":
     overview_start = now_utc - pd.Timedelta(days=7)
 elif overview_range == "Last 3 Months":
@@ -4224,14 +4231,18 @@ with _top_tabs[1]:
     # ------------------------------------------------------------
 
     # ------------------------------------------------------------
-    # ROW 1 — SLA PERFORMANCE
+    # ROW 1 — SLA PERFORMANCE (bar charts)
     # ------------------------------------------------------------
-    left, middle, right = st.columns([1.15, 1.15, 1.0])
+    left, right = st.columns([1.15, 1.15])
 
     with left:
         st.subheader("SLA Compliance by Priority")
+        st.caption("Severity only (Sev 1–4) — other priority labels (High/Medium/Low/etc.) are excluded.")
+        priority_df = overview.copy()
+        priority_df["Priority"] = priority_df["Priority"].apply(severity_bucket)
+        priority_df = priority_df[priority_df["Priority"] != "Other / Unknown"]
         priority_df = (
-            overview.groupby("Priority", as_index=False)
+            priority_df.groupby("Priority", as_index=False)
             .agg(
                 Total=("ticket", "nunique"),
                 Within_SLA=("SLA Compliance", "sum"),
@@ -4240,25 +4251,39 @@ with _top_tabs[1]:
         priority_df["Within %"] = 100 * priority_df["Within_SLA"] / priority_df["Total"].replace(0, 1)
         priority_df["Breached %"] = 100 - priority_df["Within %"]
         priority_df = priority_df.sort_values("Priority")
-        fig = go.Figure()
-        fig.add_bar(y=priority_df["Priority"], x=priority_df["Within %"], orientation="h", name="Within SLA", text=priority_df["Within %"].round(0).astype(int).astype(str) + "%")
-        fig.add_bar(y=priority_df["Priority"], x=priority_df["Breached %"], orientation="h", name="Breached", text=priority_df["Breached %"].round(0).astype(int).astype(str) + "%")
-        fig.update_layout(barmode="stack", height=285, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Percent", yaxis_title="", xaxis=dict(range=[0, 100]))
-        fig.update_traces(textposition="inside")
-        st.plotly_chart(fig, width="stretch", key="overview_priority_compliance")
+        if priority_df.empty:
+            st.info("No Sev 1–4 Jira in the selected filters.")
+        else:
+            fig = go.Figure()
+            fig.add_bar(y=priority_df["Priority"], x=priority_df["Within %"], orientation="h", name="Within SLA", text=priority_df["Within %"].round(0).astype(int).astype(str) + "%")
+            fig.add_bar(y=priority_df["Priority"], x=priority_df["Breached %"], orientation="h", name="Breached", text=priority_df["Breached %"].round(0).astype(int).astype(str) + "%")
+            fig.update_layout(barmode="stack", height=285, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Percent", yaxis_title="", xaxis=dict(range=[0, 100]))
+            fig.update_traces(textposition="inside")
+            st.plotly_chart(fig, width="stretch", key="overview_priority_compliance")
 
-    with middle:
+    with right:
         st.subheader("Average Resolution Time by Priority")
-        st.caption("Resolved Jira only — matches the \"Avg Resolution Time\" KPI above.")
+        st.caption(
+            "Severity only (Sev 1–4), resolved Jira only — matches the "
+            "\"Avg Resolution Time\" KPI above. Other priority labels "
+            "(High/Medium/Low/etc.) are excluded."
+        )
         # Use the same scope as the top-level "Avg Resolution Time" KPI
         # (Lifecycle == "Completed"). The old version averaged "SLA Hours"
         # across ALL Jira including still-open ones, whose SLA clock keeps
         # climbing — that silently inflated this "resolution time" with
         # tickets that haven't actually been resolved yet, and disagreed
         # with the KPI card showing the same label.
-        _priority_order = overview["Priority"].drop_duplicates()
+        _sev_overview = overview.copy()
+        _sev_overview["Priority"] = _sev_overview["Priority"].apply(severity_bucket)
+        _sev_overview = _sev_overview[_sev_overview["Priority"] != "Other / Unknown"]
+        _sev_resolved = resolved_for_time.copy()
+        _sev_resolved["Priority"] = _sev_resolved["Priority"].apply(severity_bucket)
+        _sev_resolved = _sev_resolved[_sev_resolved["Priority"] != "Other / Unknown"]
+        _priority_order = pd.Series(["Sev 1", "Sev 2", "Sev 3", "Sev 4"])
+        _priority_order = _priority_order[_priority_order.isin(_sev_overview["Priority"])]
         avg_priority = (
-            resolved_for_time.groupby("Priority", as_index=False)
+            _sev_resolved.groupby("Priority", as_index=False)
             .agg(
                 Average=("SLA Hours", "mean"),
                 P90=("SLA Hours", lambda x: x.quantile(0.90)),
@@ -4277,16 +4302,24 @@ with _top_tabs[1]:
         avg_priority["P90"] = pd.to_numeric(
             avg_priority.get("P90", pd.Series(dtype=float)), errors="coerce"
         ).fillna(0)
-        if not (overview["Lifecycle"] == "Completed").any():
-            st.info("No resolved Jira in the selected filters yet — showing all Jira as a fallback.")
-        fig = go.Figure()
-        fig.add_bar(x=avg_priority["Priority"], y=avg_priority["Median/Avg"], name="Average", text=avg_priority["Median/Avg"].round(1).astype(str) + "h")
-        fig.add_bar(x=avg_priority["Priority"], y=avg_priority["P90"], name="P90", text=avg_priority["P90"].round(1).astype(str) + "h")
-        fig.update_layout(height=285, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Hours", xaxis_title="")
-        fig.update_traces(textposition="outside")
-        st.plotly_chart(fig, width="stretch", key="overview_resolution_priority")
+        if avg_priority.empty:
+            st.info("No Sev 1–4 Jira in the selected filters.")
+        else:
+            if not (overview["Lifecycle"] == "Completed").any():
+                st.info("No resolved Jira in the selected filters yet — showing all Jira as a fallback.")
+            fig = go.Figure()
+            fig.add_bar(x=avg_priority["Priority"], y=avg_priority["Median/Avg"], name="Average", text=avg_priority["Median/Avg"].round(1).astype(str) + "h")
+            fig.add_bar(x=avg_priority["Priority"], y=avg_priority["P90"], name="P90", text=avg_priority["P90"].round(1).astype(str) + "h")
+            fig.update_layout(height=285, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Hours", xaxis_title="")
+            fig.update_traces(textposition="outside")
+            st.plotly_chart(fig, width="stretch", key="overview_resolution_priority")
 
-    with right:
+    # ------------------------------------------------------------
+    # ROW 2 — ALL PIE / DONUT CHARTS, SIDE BY SIDE
+    # ------------------------------------------------------------
+    pie_left, pie_middle, pie_right = st.columns([1.0, 1.0, 1.0])
+
+    with pie_left:
         st.subheader("SLA Breaches by Status")
         breach_df = overview[overview["SLA Breached"]].copy()
         if breach_df.empty:
@@ -4298,38 +4331,7 @@ with _top_tabs[1]:
             fig.add_annotation(text=f"{breached_count}<br><span style='font-size:11px'>Total</span>", x=.5, y=.5, showarrow=False)
             st.plotly_chart(fig, width="stretch", key="overview_breach_status")
 
-    # ------------------------------------------------------------
-    # ROW 2 — TRANSITION / OWNERSHIP
-    # ------------------------------------------------------------
-    # "Time Spent in Each Status (Average)" used to live here as a standalone
-    # bar chart, but it was showing the exact same per-status average already
-    # in the "Avg Time" column of the Transition SLA table below — a strict
-    # subset of that table's info (which also has P90, target and SLA %) —
-    # so it was dropped as a duplicate rather than kept for its own sake.
-    middle, right = st.columns([1.4, 1.0])
-
-    with middle:
-        st.subheader("SLA Age by Current Status (Average | P90)")
-        st.caption(
-            "\"Avg/P90 Time\" is total elapsed SLA time (since creation) for "
-            "Jira currently sitting in each status — not the duration of that "
-            "one transition step. A high number here means tickets are aging "
-            "badly while stuck in that status, not that the step itself is slow."
-        )
-        transition_rows = []
-        for queue, group in overview.groupby("Queue"):
-            vals = group["SLA Hours"]
-            transition_rows.append({
-                "Status": queue,
-                "Avg Age": format_hours_value(vals.mean()),
-                "P90 Age": format_hours_value(vals.quantile(.90)),
-                "SLA Target": format_hours_value(overview[overview["Queue"] == queue]["Target Hours"].median()),
-                "SLA %": f"{100 * group['SLA Compliance'].mean():.0f}%",
-            })
-        transition_display = pd.DataFrame(transition_rows)
-        st.dataframe(transition_display, width="stretch", hide_index=True, height=300)
-
-    with right:
+    with pie_middle:
         st.subheader("Ownership Time Breakdown (Average)")
         ownership = pd.DataFrame({
             "Category": ["L3", "Developers", "Other (counted)", "On Hold (Customer Wait / Observation)"],
@@ -4342,89 +4344,45 @@ with _top_tabs[1]:
         })
         ownership = ownership[ownership["Hours"] > 0]
         fig = px.pie(ownership, names="Category", values="Hours", hole=.55)
-        fig.update_layout(height=300, margin=dict(l=5, r=5, t=10, b=10))
+        fig.update_layout(height=285, margin=dict(l=5, r=5, t=10, b=10))
         fig.add_annotation(text=f"{format_hours_value(overview['SLA Hours'].mean())}<br><span style='font-size:11px'>Avg Total</span>", x=.5, y=.5, showarrow=False)
         st.plotly_chart(fig, width="stretch", key="overview_ownership")
 
-    # ------------------------------------------------------------
-    # ROW 3 — AGING + OWNERS
-    # ------------------------------------------------------------
-    # "Top L3 Owners" used to sit here as a full column, but it always reads
-    # "No L3 ownership data available" — canonical_person_role() only
-    # recognizes 2 hardcoded L3 names (PERSON_ROLE_MAP), so almost no
-    # currently-open ticket resolves to role == "L3" even though L3 work is
-    # clearly happening (see Ownership Time Breakdown). A widget that never
-    # has data trains people to ignore it, so it's pulled out of the main
-    # grid until the roster is current — see the expander below instead.
-    left, right = st.columns([1.0, 1.3])
-
-    with left:
-        st.subheader("Open Jira Aging")
-        open_df = overview[overview["Lifecycle"] == "Open"].copy()
-        if open_df.empty:
-            st.info("No open Jira in the selected period.")
+    with pie_right:
+        st.subheader("Handoff Analysis")
+        if transitions.empty:
+            st.info("No transition data available.")
         else:
-            open_df["Age Hours"] = (pd.Timestamp.now(tz="UTC") - open_df["Dashboard Date"]).dt.total_seconds() / 3600
-            bins = [-1, 4, 12, 24, 48, 72, float("inf")]
-            labels = ["0–4h", "4–12h", "12–24h", "24–48h", "48–72h", "72h+"]
-            open_df["Aging"] = pd.cut(open_df["Age Hours"].fillna(0), bins=bins, labels=labels)
-            aging = open_df.groupby("Aging", observed=False)["ticket"].nunique().reindex(labels, fill_value=0).reset_index()
-            aging.columns = ["Aging", "Tickets"]
-            fig = px.bar(aging, x="Aging", y="Tickets", text="Tickets")
-            fig.update_traces(textposition="outside")
-            fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="", yaxis_title="Jira")
-            st.plotly_chart(fig, width="stretch", key="overview_aging")
-
-    with right:
-        st.subheader("Top Developer Owners")
-        dev = overview[overview["current_role"].astype(str).str.upper() == "DEV"].copy()
-        if dev.empty:
-            st.info("No developer ownership data available.")
-        else:
-            owner_table = dev.groupby("current_owner", as_index=False).agg(
-                Jira_Handled=("ticket", "nunique"),
-                Avg_Ownership_Hours=("dev_minutes", lambda x: x.sum() / max(1, x.count()) / 60),
-                SLA_Compliance=("SLA Compliance", "mean"),
-            ).sort_values("Avg_Ownership_Hours", ascending=False).head(8)
-            owner_table["Avg Ownership"] = owner_table["Avg_Ownership_Hours"].apply(format_hours_value)
-            owner_table["SLA %"] = (owner_table["SLA_Compliance"].fillna(0) * 100).round(0).astype(int).astype(str) + "%"
-            st.dataframe(owner_table[["current_owner", "Jira_Handled", "Avg Ownership", "SLA %"]].rename(columns={"current_owner":"Developer", "Jira_Handled":"Jira Handled"}), width="stretch", hide_index=True, height=280)
-
-    with st.expander("Top L3 Owners (needs roster fix — currently unreliable)"):
-        st.caption(
-            "canonical_person_role() only recognizes L3 triagers listed in "
-            "PERSON_ROLE_MAP (currently just 2 names). Anyone else falls "
-            "back to historical transition data, which is often blank, so "
-            "this table under-reports real L3 ownership. Add the current L3 "
-            "roster to PERSON_ROLE_MAP to fix it properly."
-        )
-        l3 = overview[overview["current_role"].astype(str).str.upper() == "L3"].copy()
-        if l3.empty:
-            st.info("No L3 ownership data available.")
-        else:
-            owner_table = l3.groupby("current_owner", as_index=False).agg(
-                Jira_Handled=("ticket", "nunique"),
-                Avg_Ownership_Hours=("l3_minutes", lambda x: x.sum() / max(1, x.count()) / 60),
-                SLA_Compliance=("SLA Compliance", "mean"),
-            ).sort_values("Avg_Ownership_Hours", ascending=False).head(8)
-            owner_table["Avg Ownership"] = owner_table["Avg_Ownership_Hours"].apply(format_hours_value)
-            owner_table["SLA %"] = (owner_table["SLA_Compliance"].fillna(0) * 100).round(0).astype(int).astype(str) + "%"
-            st.dataframe(owner_table[["current_owner", "Jira_Handled", "Avg Ownership", "SLA %"]].rename(columns={"current_owner":"L3 Triager", "Jira_Handled":"Jira Handled"}), width="stretch", hide_index=True, height=280)
+            handoff = transitions.groupby("ticket")["assigned_to"].nunique().reset_index(name="Owners")
+            handoff["Bucket"] = pd.cut(handoff["Owners"], bins=[0,1,2,3,float("inf")], labels=["1 Owner", "2 Owners", "3 Owners", "4+ Owners"])
+            handoff_counts = handoff.groupby("Bucket", observed=False)["ticket"].nunique().reindex(["1 Owner","2 Owners","3 Owners","4+ Owners"], fill_value=0).reset_index()
+            handoff_counts.columns = ["Owners", "Jira"]
+            fig = px.pie(handoff_counts, names="Owners", values="Jira", hole=.5)
+            fig.update_layout(height=285, margin=dict(l=5, r=5, t=10, b=10))
+            st.plotly_chart(fig, width="stretch", key="overview_handoffs")
 
     # ------------------------------------------------------------
-    # ROW 4 — HANDOFFS
+    # ROW 3 — TABLES (kept separate from the charts above)
     # ------------------------------------------------------------
-    st.subheader("Handoff Analysis")
-    if transitions.empty:
-        st.info("No transition data available.")
-    else:
-        handoff = transitions.groupby("ticket")["assigned_to"].nunique().reset_index(name="Owners")
-        handoff["Bucket"] = pd.cut(handoff["Owners"], bins=[0,1,2,3,float("inf")], labels=["1 Owner", "2 Owners", "3 Owners", "4+ Owners"])
-        handoff_counts = handoff.groupby("Bucket", observed=False)["ticket"].nunique().reindex(["1 Owner","2 Owners","3 Owners","4+ Owners"], fill_value=0).reset_index()
-        handoff_counts.columns = ["Owners", "Jira"]
-        fig = px.pie(handoff_counts, names="Owners", values="Jira", hole=.5)
-        fig.update_layout(height=280, margin=dict(l=5, r=5, t=10, b=10))
-        st.plotly_chart(fig, width="stretch", key="overview_handoffs")
+    st.subheader("SLA Age by Current Status (Average | P90)")
+    st.caption(
+        "\"Avg/P90 Time\" is total elapsed SLA time (since creation) for "
+        "Jira currently sitting in each status — not the duration of that "
+        "one transition step. A high number here means tickets are aging "
+        "badly while stuck in that status, not that the step itself is slow."
+    )
+    transition_rows = []
+    for queue, group in overview.groupby("Queue"):
+        vals = group["SLA Hours"]
+        transition_rows.append({
+            "Status": queue,
+            "Avg Age": format_hours_value(vals.mean()),
+            "P90 Age": format_hours_value(vals.quantile(.90)),
+            "SLA Target": format_hours_value(overview[overview["Queue"] == queue]["Target Hours"].median()),
+            "SLA %": f"{100 * group['SLA Compliance'].mean():.0f}%",
+        })
+    transition_display = pd.DataFrame(transition_rows)
+    st.dataframe(transition_display, width="stretch", hide_index=True, height=300)
 
     # ------------------------------------------------------------
     # Active Jira drill-down
